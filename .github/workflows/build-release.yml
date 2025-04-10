@@ -172,9 +172,8 @@ jobs:
 
           # Escape characters for JSON and multiline handling in set-output
           changelog_content="${changelog_content//'%'/'%25'}"
-          changelog_content="${changelog_content//$'
-'/'%0A'}"
-          changelog_content="${changelog_content//$''/'%0D'}"
+          changelog_content="${changelog_content//$''/'%0A'}"
+          changelog_content="${changelog_content//$''/'%0D'}"
           changelog_content="${changelog_content//':::'/'%0A%0A'}" # Replace delimiter with double newline
 
           echo "changelog<<EOF" >> $GITHUB_OUTPUT

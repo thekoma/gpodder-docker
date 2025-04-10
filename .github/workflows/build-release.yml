@@ -1,0 +1,223 @@
+name: Build and Release mygpo Docker Image
+
+on:
+  schedule:
+    # Runs daily at 05:00 UTC
+    - cron: '0 5 * * *'
+  push:
+    branches:
+      - main
+    paths:
+      - 'Dockerfile'
+      - '.github/workflows/build-release.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write # To create releases and update last_source_commit.txt
+  packages: write # To push images to GHCR
+
+env:
+  REGISTRY: ghcr.io
+  # IMAGE_NAME format: owner/repo_name (lowercase)
+  IMAGE_NAME: ${{ github.repository_owner }}/${{ github.event.repository.name }}
+  SOURCE_REPO_URL: https://github.com/gpodder/mygpo.git
+  SOURCE_REPO_DIR: /tmp/mygpo-source
+  COMMIT_FILE: last_source_commit.txt
+
+jobs:
+  check_updates:
+    name: Check for mygpo Source Updates
+    runs-on: ubuntu-latest
+    outputs:
+      has_updates: ${{ steps.check.outputs.has_updates }}
+      new_commit_sha: ${{ steps.check.outputs.new_commit_sha }}
+      old_commit_sha: ${{ steps.check.outputs.old_commit_sha }}
+
+    steps:
+      - name: Checkout This Repository
+        uses: actions/checkout@v4
+
+      - name: Read Last Processed Commit SHA
+        id: read_commit
+        run: |
+          if [[ -f "${{ env.COMMIT_FILE }}" ]]; then
+            echo "old_commit_sha=$(cat ${{ env.COMMIT_FILE }})" >> $GITHUB_OUTPUT
+          else
+            echo "Commit file not found, will fetch initial commit."
+            # Use a known old commit or handle first run in comparison logic
+            echo "old_commit_sha=none" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Clone Source Repository (Shallow)
+        run: git clone --depth 1 ${{ env.SOURCE_REPO_URL }} ${{ env.SOURCE_REPO_DIR }}
+
+      - name: Get Latest Source Commit SHA
+        id: get_latest_commit
+        run: |
+          cd ${{ env.SOURCE_REPO_DIR }}
+          latest_sha=$(git rev-parse HEAD)
+          echo "new_commit_sha=$latest_sha" >> $GITHUB_OUTPUT
+
+      - name: Compare SHAs and Determine Update Status
+        id: check
+        run: |
+          old_sha="${{ steps.read_commit.outputs.old_commit_sha }}"
+          new_sha="${{ steps.get_latest_commit.outputs.new_commit_sha }}"
+          echo "Old SHA: $old_sha"
+          echo "New SHA: $new_sha"
+          if [[ "$old_sha" == "$new_sha" || "$old_sha" == "none" && "${{ github.event_name }}" == "schedule" ]]; then
+            # No update if SHAs match, or if it's the first scheduled run (avoid initial release)
+            echo "No new commits detected or initial scheduled run."
+            echo "has_updates=false" >> $GITHUB_OUTPUT
+          else
+            echo "New commits detected."
+            echo "has_updates=true" >> $GITHUB_OUTPUT
+          fi
+          # Pass through the SHAs for other jobs
+          echo "new_commit_sha=$new_sha" >> $GITHUB_OUTPUT
+          echo "old_commit_sha=$old_sha" >> $GITHUB_OUTPUT
+
+  build_push:
+    name: Build and Push Docker Image
+    needs: check_updates
+    # Run if updates found OR if triggered by push/dispatch (manual build)
+    if: needs.check_updates.outputs.has_updates == 'true' || github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout This Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and Push Docker Image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+            ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  create_release:
+    name: Create Release and Update Commit File
+    needs: [check_updates, build_push]
+    # Only run if updates were detected AND build succeeded
+    if: needs.check_updates.outputs.has_updates == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout This Repository
+        uses: actions/checkout@v4
+        with:
+          # Fetch all history for all tags and branches for version calculation
+          fetch-depth: 0
+
+      - name: Clone Source Repository (Full for Log)
+        run: |
+          rm -rf ${{ env.SOURCE_REPO_DIR }} # Remove shallow clone if exists
+          git clone ${{ env.SOURCE_REPO_URL }} ${{ env.SOURCE_REPO_DIR }}
+
+      - name: Generate Release Tag (YYYY.MM.N)
+        id: generate_tag
+        run: |
+          # Fetch tags from the current repo
+          git fetch --tags
+          current_year_month=$(date +'%Y.%m')
+          # Find the highest release number for the current month/year
+          last_tag=$(git tag --list "${current_year_month}.*" --sort='-version:refname' | head -n 1)
+          next_release_num=0
+          if [[ -n "$last_tag" ]]; then
+            last_release_num=$(echo "$last_tag" | awk -F. '{print $3}')
+            next_release_num=$((last_release_num + 1))
+          fi
+          new_tag="${current_year_month}.${next_release_num}"
+          echo "Generated Tag: $new_tag"
+          echo "tag=$new_tag" >> $GITHUB_OUTPUT
+
+      - name: Generate Changelog
+        id: generate_changelog
+        run: |
+          cd ${{ env.SOURCE_REPO_DIR }}
+          old_sha="${{ needs.check_updates.outputs.old_commit_sha }}"
+          new_sha="${{ needs.check_updates.outputs.new_commit_sha }}"
+          echo "Generating changelog from $old_sha to $new_sha"
+          # Use a simple log format. Handle the case where old_sha is 'none' (first run)
+          if [[ "$old_sha" == "none" ]]; then
+            log_range="$new_sha" # Show only the latest commit on first run
+            echo "First run, using latest commit for changelog."
+          else
+            log_range="${old_sha}..${new_sha}"
+            echo "Generating log for range: $log_range"
+          fi
+
+          # Use ::: as delimiter for multiline commit messages in the output
+          changelog_content=$(git log --pretty=format:'* %h %s (%an)%n%b%n:::' $log_range)
+
+          # Check if changelog is empty (e.g., only merge commits without messages)
+          if [[ -z "$changelog_content" ]]; then
+            changelog_content="* No user-visible changes detected between $old_sha and $new_sha."
+          fi
+
+          # Escape characters for JSON and multiline handling in set-output
+          changelog_content="${changelog_content//'%'/'%25'}"
+          changelog_content="${changelog_content//$'
+'/'%0A'}"
+          changelog_content="${changelog_content//$''/'%0D'}"
+          changelog_content="${changelog_content//':::'/'%0A%0A'}" # Replace delimiter with double newline
+
+          echo "changelog<<EOF" >> $GITHUB_OUTPUT
+          echo "$changelog_content" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          cd -
+
+      - name: Create GitHub Release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ steps.generate_tag.outputs.tag }}
+          release_name: Release ${{ steps.generate_tag.outputs.tag }}
+          body: |
+            Automatic release based on updates in gpodder/mygpo.
+
+            **Changes since commit `${{ needs.check_updates.outputs.old_commit_sha }}`:**
+
+            ${{ steps.generate_changelog.outputs.changelog }}
+
+            **Docker Image:**
+            `${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.generate_tag.outputs.tag }}`
+          draft: false
+          prerelease: false
+
+      - name: Tag Docker Image with Release Tag
+        run: |
+          docker buildx imagetools create --tag ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.generate_tag.outputs.tag }} ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
+
+      - name: Update Last Processed Commit SHA File
+        run: |
+          echo "${{ needs.check_updates.outputs.new_commit_sha }}" > ${{ env.COMMIT_FILE }}
+
+      - name: Commit and Push Updated Commit File
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          git add ${{ env.COMMIT_FILE }}
+          # Check if there are changes to commit
+          if git diff --staged --quiet; then
+            echo "No changes to commit in ${{ env.COMMIT_FILE }}."
+          else
+            git commit -m "chore: Update last processed mygpo commit to ${{ needs.check_updates.outputs.new_commit_sha }}"
+            git push
+          fi
